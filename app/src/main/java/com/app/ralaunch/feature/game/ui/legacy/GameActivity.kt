@@ -1,5 +1,7 @@
 package com.app.ralaunch.feature.game.ui.legacy
 
+import com.app.ralaunch.feature.game.secondary.SecondaryDisplayBridge
+import com.app.ralaunch.feature.game.secondary.SecondaryDisplayPresenter
 import android.annotation.SuppressLint
 import android.app.Activity
 import android.content.Context
@@ -35,6 +37,9 @@ import org.libsdl.app.SDLActivity
  * 继承 SDLActivity，实现 MVP 的 View 层
  */
 class GameActivity : SDLActivity(), GameContract.View {
+
+    // Second-screen window (e.g. AYN Thor bottom display); only shown when a mod asks for it
+    private var secondaryDisplay: SecondaryDisplayPresenter? = null
 
     companion object {
         private const val TAG = "GameActivity"
@@ -145,6 +150,14 @@ class GameActivity : SDLActivity(), GameContract.View {
         instance = this
         presenter.attach(this)
 
+        try {
+            secondaryDisplay = SecondaryDisplayPresenter(this)
+            SecondaryDisplayBridge.controller = { enable -> secondaryDisplay?.setEnabled(enable) }
+            SecondaryDisplayBridge.nativeInit()
+        } catch (e: Throwable) {
+            AppLog.w(TAG, "Secondary display bridge unavailable: ${e.message}")
+        }
+
         initializeErrorHandler()
         forceLandscapeOrientation()
         initializeFullscreenManager()
@@ -219,6 +232,7 @@ class GameActivity : SDLActivity(), GameContract.View {
     override fun onResume() {
         super.onResume()
         requestHighRefreshRate("onResume")
+        secondaryDisplay?.onResume()
     }
 
     @Deprecated("Deprecated in Java")
@@ -238,6 +252,9 @@ class GameActivity : SDLActivity(), GameContract.View {
 
     override fun onDestroy() {
         AppLog.d(TAG, "GameActivity.onDestroy() called")
+        SecondaryDisplayBridge.controller = null
+        secondaryDisplay?.release()
+        secondaryDisplay = null
 
         virtualControlsManager.stop()
         presenter.detach()

@@ -58,6 +58,7 @@ add_library(${CMAKE_PROJECT_NAME} SHARED
         src/logger.cpp
         src/jni_entry.cpp
         src/osm_renderer.cpp
+        src/secondary_display.cpp
         src/dotnet/corehost_hooks.cpp
         src/dotnet/dotnet_launcher.cpp
         src/mono/mono_launcher.cpp

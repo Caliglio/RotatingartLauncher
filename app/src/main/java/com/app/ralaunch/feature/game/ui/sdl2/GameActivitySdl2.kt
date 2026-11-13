@@ -1,5 +1,7 @@
 package com.app.ralaunch.feature.game.ui.sdl2
 
+import com.app.ralaunch.feature.game.secondary.SecondaryDisplayBridge
+import com.app.ralaunch.feature.game.secondary.SecondaryDisplayPresenter
 import android.annotation.SuppressLint
 import android.app.Activity
 import android.content.Context
@@ -61,6 +63,9 @@ import org.libsdl.app2.SDLActivity
  */
 class GameActivitySdl2 : SDLActivity(), GameContract.View, LifecycleOwner, SavedStateRegistryOwner,
     ActivityResultRegistryOwner {
+
+    // Second-screen window (e.g. AYN Thor bottom display); only shown when a mod asks for it
+    private var secondaryDisplay: SecondaryDisplayPresenter? = null
 
     companion object {
         private const val TAG = "GameActivitySdl2"
@@ -199,6 +204,14 @@ class GameActivitySdl2 : SDLActivity(), GameContract.View, LifecycleOwner, Saved
         presenter.attach(this)
 
         try {
+            secondaryDisplay = SecondaryDisplayPresenter(this)
+            SecondaryDisplayBridge.controller = { enable -> secondaryDisplay?.setEnabled(enable) }
+            SecondaryDisplayBridge.nativeInit()
+        } catch (e: Throwable) {
+            AppLog.w(TAG, "Secondary display bridge unavailable: ${e.message}")
+        }
+
+        try {
             ErrorHandler.init(this)
         } catch (e: Exception) {
             AppLog.e(TAG, "设置 ErrorHandler 失败: ${e.message}")
@@ -243,6 +256,7 @@ class GameActivitySdl2 : SDLActivity(), GameContract.View, LifecycleOwner, Saved
         composeOwner.onResume()
         requestHighRefreshRate("onResume")
         startGameWhenSurfaceReady()
+        secondaryDisplay?.onResume()
     }
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
@@ -376,6 +390,9 @@ class GameActivitySdl2 : SDLActivity(), GameContract.View, LifecycleOwner, Saved
 
     override fun onDestroy() {
         AppLog.d(TAG, "GameActivitySdl2.onDestroy()")
+        SecondaryDisplayBridge.controller = null
+        secondaryDisplay?.release()
+        secondaryDisplay = null
         composeOwner.onDestroy()
         virtualControlsManager.stop()
         instance = null
