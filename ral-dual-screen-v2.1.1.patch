@@ -1,0 +1,522 @@
+diff --git a/app/src/main/cpp/main/CMakeLists.txt b/app/src/main/cpp/main/CMakeLists.txt
+index e2afc8b..e0a2254 100644
+--- a/app/src/main/cpp/main/CMakeLists.txt
++++ b/app/src/main/cpp/main/CMakeLists.txt
+@@ -14,6 +14,7 @@ set(MAIN_SOURCES
+         dotnet/corehost_hooks.cpp
+         utils/native_methods.cpp
+         core/game_launcher.cpp
++        secondary_display.cpp
+ 
+ )
+ 
+diff --git a/app/src/main/cpp/main/secondary_display.cpp b/app/src/main/cpp/main/secondary_display.cpp
+new file mode 100644
+index 0000000..4a182f4
+--- /dev/null
++++ b/app/src/main/cpp/main/secondary_display.cpp
+@@ -0,0 +1,194 @@
++// Second-screen support (e.g. AYN Thor bottom display).
++//
++// Kotlin (SecondaryDisplayPresenter) owns a Presentation + SurfaceView on the other display and feeds
++// us its Surface and touch events through the JNI functions below. The game's managed code (a mod)
++// calls the plain C exports (RAL_Secondary_*) via dlsym/NativeLibrary to push RGBA frames and to read
++// touches. Frames are copied straight into the Surface with ANativeWindow (no EGL, no Java hop).
++
++#include <jni.h>
++#include <android/native_window.h>
++#include <android/native_window_jni.h>
++#include <algorithm>
++#include <cstdint>
++#include <cstring>
++#include <deque>
++#include <mutex>
++
++#include <android/log.h>
++
++#include "jni_entry.h"
++
++#define LOG_TAG "RALSecondary"
++#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
++#define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
++#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
++
++#define RAL_EXPORT extern "C" __attribute__((visibility("default")))
++
++namespace {
++
++struct TouchEvent {
++    int type;   // 0 down, 1 move, 2 up
++    int id;
++    float x;    // 0..1
++    float y;    // 0..1
++};
++
++std::mutex g_window_mutex;
++ANativeWindow *g_window = nullptr;
++int g_width = 0;
++int g_height = 0;
++
++std::mutex g_touch_mutex;
++std::deque<TouchEvent> g_touches;
++constexpr size_t kMaxQueuedTouches = 512;
++
++jclass g_bridge_class = nullptr;          // global ref
++jmethodID g_request_method = nullptr;     // static void requestFromNative(boolean)
++
++}  // namespace
++
++// ------------------------------------------------------------------ JNI (called from Kotlin)
++
++extern "C" JNIEXPORT void JNICALL
++Java_com_app_ralaunch_feature_game_secondary_SecondaryDisplayBridge_nativeInit(
++        JNIEnv *env, jclass clazz) {
++    if (g_bridge_class == nullptr) {
++        g_bridge_class = reinterpret_cast<jclass>(env->NewGlobalRef(clazz));
++    }
++    g_request_method = env->GetStaticMethodID(clazz, "requestFromNative", "(Z)V");
++    if (g_request_method == nullptr) {
++        env->ExceptionClear();
++        LOGE("SecondaryDisplay: requestFromNative not found");
++    }
++}
++
++extern "C" JNIEXPORT void JNICALL
++Java_com_app_ralaunch_feature_game_secondary_SecondaryDisplayBridge_nativeSurfaceChanged(
++        JNIEnv *env, jclass clazz, jobject surface, jint width, jint height) {
++    (void) clazz;
++    ANativeWindow *window = surface ? ANativeWindow_fromSurface(env, surface) : nullptr;
++
++    std::lock_guard<std::mutex> lock(g_window_mutex);
++    if (g_window != nullptr) {
++        ANativeWindow_release(g_window);
++        g_window = nullptr;
++    }
++    g_window = window;
++    if (g_window != nullptr) {
++        // Keep the buffer size chosen by Kotlin (SurfaceHolder.setFixedSize); just force RGBA8888.
++        ANativeWindow_setBuffersGeometry(g_window, 0, 0, WINDOW_FORMAT_RGBA_8888);
++        g_width = ANativeWindow_getWidth(g_window);
++        g_height = ANativeWindow_getHeight(g_window);
++        if (g_width <= 0) g_width = width;
++        if (g_height <= 0) g_height = height;
++        LOGI("SecondaryDisplay: surface ready %dx%d", g_width, g_height);
++    } else {
++        g_width = g_height = 0;
++    }
++}
++
++extern "C" JNIEXPORT void JNICALL
++Java_com_app_ralaunch_feature_game_secondary_SecondaryDisplayBridge_nativeSurfaceDestroyed(
++        JNIEnv *env, jclass clazz) {
++    (void) env;
++    (void) clazz;
++    std::lock_guard<std::mutex> lock(g_window_mutex);
++    if (g_window != nullptr) {
++        ANativeWindow_release(g_window);
++        g_window = nullptr;
++    }
++    g_width = g_height = 0;
++    LOGI("SecondaryDisplay: surface destroyed");
++}
++
++extern "C" JNIEXPORT void JNICALL
++Java_com_app_ralaunch_feature_game_secondary_SecondaryDisplayBridge_nativeTouch(
++        JNIEnv *env, jclass clazz, jint type, jint id, jfloat x, jfloat y) {
++    (void) env;
++    (void) clazz;
++    std::lock_guard<std::mutex> lock(g_touch_mutex);
++    if (g_touches.size() >= kMaxQueuedTouches) {
++        // Drop oldest *move* events first so down/up are never lost.
++        for (auto it = g_touches.begin(); it != g_touches.end(); ++it) {
++            if (it->type == 1) {
++                g_touches.erase(it);
++                break;
++            }
++        }
++        if (g_touches.size() >= kMaxQueuedTouches) g_touches.pop_front();
++    }
++    g_touches.push_back({type, id, x, y});
++}
++
++// ------------------------------------------------------------------ C exports (called from the mod)
++
++// Lets the mod check that it is running on a launcher that has this feature.
++RAL_EXPORT int RAL_Secondary_Version(void) {
++    return 1;
++}
++
++// Ask the launcher to show (1) or hide (0) the second-screen window.
++RAL_EXPORT void RAL_Secondary_SetEnabled(int enable) {
++    if (g_bridge_class == nullptr || g_request_method == nullptr) {
++        LOGW("SecondaryDisplay: bridge not initialised, ignoring SetEnabled");
++        return;
++    }
++    JNIEnv *env = JniEntry_GetEnv();
++    if (env == nullptr) return;
++    env->CallStaticVoidMethod(g_bridge_class, g_request_method, static_cast<jboolean>(enable ? 1 : 0));
++    if (env->ExceptionCheck()) {
++        env->ExceptionClear();
++        LOGE("SecondaryDisplay: exception in requestFromNative");
++    }
++}
++
++// Writes the surface size and returns 1 when a surface is available, else 0.
++RAL_EXPORT int RAL_Secondary_GetSize(int *width, int *height) {
++    std::lock_guard<std::mutex> lock(g_window_mutex);
++    if (g_window == nullptr || g_width <= 0 || g_height <= 0) return 0;
++    if (width) *width = g_width;
++    if (height) *height = g_height;
++    return 1;
++}
++
++// Copies a tightly-packed RGBA8888 frame (w*h*4 bytes, top row first) to the surface.
++// Returns 0 on success, negative on failure.
++RAL_EXPORT int RAL_Secondary_Present(const uint8_t *rgba, int w, int h) {
++    if (rgba == nullptr || w <= 0 || h <= 0) return -1;
++
++    std::lock_guard<std::mutex> lock(g_window_mutex);
++    if (g_window == nullptr) return -2;
++
++    ANativeWindow_Buffer buffer;
++    if (ANativeWindow_lock(g_window, &buffer, nullptr) != 0) return -3;
++
++    int rc = 0;
++    if (buffer.format == WINDOW_FORMAT_RGBA_8888 || buffer.format == WINDOW_FORMAT_RGBX_8888) {
++        const int copyW = std::min(w, static_cast<int>(buffer.width));
++        const int copyH = std::min(h, static_cast<int>(buffer.height));
++        auto *dst = static_cast<uint8_t *>(buffer.bits);
++        const size_t dstStride = static_cast<size_t>(buffer.stride) * 4;
++        const size_t srcStride = static_cast<size_t>(w) * 4;
++        for (int y = 0; y < copyH; ++y) {
++            std::memcpy(dst + y * dstStride, rgba + y * srcStride, static_cast<size_t>(copyW) * 4);
++        }
++    } else {
++        rc = -4;  // unexpected pixel format
++    }
++    ANativeWindow_unlockAndPost(g_window);
++    return rc;
++}
++
++// Pops one queued touch event. Returns 1 if an event was written, 0 if the queue is empty.
++RAL_EXPORT int RAL_Secondary_PollTouch(int *type, int *id, float *x, float *y) {
++    std::lock_guard<std::mutex> lock(g_touch_mutex);
++    if (g_touches.empty()) return 0;
++    const TouchEvent ev = g_touches.front();
++    g_touches.pop_front();
++    if (type) *type = ev.type;
++    if (id) *id = ev.id;
++    if (x) *x = ev.x;
++    if (y) *y = ev.y;
++    return 1;
++}
+diff --git a/app/src/main/java/com/app/ralaunch/feature/game/secondary/SecondaryDisplayBridge.kt b/app/src/main/java/com/app/ralaunch/feature/game/secondary/SecondaryDisplayBridge.kt
+new file mode 100644
+index 0000000..9a68856
+--- /dev/null
++++ b/app/src/main/java/com/app/ralaunch/feature/game/secondary/SecondaryDisplayBridge.kt
+@@ -0,0 +1,50 @@
++package com.app.ralaunch.feature.game.secondary
++
++import android.util.Log
++import android.view.Surface
++
++/**
++ * Glue between the game's managed code (a mod, via libmain.so exports in secondary_display.cpp)
++ * and the secondary-display window owned by [SecondaryDisplayPresenter].
++ *
++ * Direction of traffic:
++ *  - mod -> native -> Kotlin : [requestFromNative] (turn the second screen on/off)
++ *  - Kotlin -> native        : surface lifecycle + touch events
++ *  - mod -> native           : frames are blitted straight into the Surface from C++ (no Java hop)
++ */
++object SecondaryDisplayBridge {
++    private const val TAG = "RALSecondary"
++
++    /** Set by the running game activity; called on the main thread. */
++    @Volatile
++    var controller: ((Boolean) -> Unit)? = null
++
++    init {
++        try {
++            System.loadLibrary("main")
++        } catch (e: UnsatisfiedLinkError) {
++            Log.w(TAG, "libmain not loaded yet: ${e.message}")
++        }
++    }
++
++    /** Invoked from C++ (RAL_Secondary_SetEnabled). */
++    @JvmStatic
++    fun requestFromNative(enable: Boolean) {
++        android.os.Handler(android.os.Looper.getMainLooper()).post {
++            controller?.invoke(enable)
++        }
++    }
++
++    @JvmStatic
++    external fun nativeInit()
++
++    @JvmStatic
++    external fun nativeSurfaceChanged(surface: Surface, width: Int, height: Int)
++
++    @JvmStatic
++    external fun nativeSurfaceDestroyed()
++
++    /** type: 0 = down, 1 = move, 2 = up. x/y are normalised 0..1 across the view. */
++    @JvmStatic
++    external fun nativeTouch(type: Int, id: Int, x: Float, y: Float)
++}
+diff --git a/app/src/main/java/com/app/ralaunch/feature/game/secondary/SecondaryDisplayPresenter.kt b/app/src/main/java/com/app/ralaunch/feature/game/secondary/SecondaryDisplayPresenter.kt
+new file mode 100644
+index 0000000..710b3f6
+--- /dev/null
++++ b/app/src/main/java/com/app/ralaunch/feature/game/secondary/SecondaryDisplayPresenter.kt
+@@ -0,0 +1,193 @@
++package com.app.ralaunch.feature.game.secondary
++
++import android.annotation.SuppressLint
++import android.app.Activity
++import android.app.Presentation
++import android.content.Context
++import android.graphics.Color
++import android.graphics.drawable.ColorDrawable
++import android.hardware.display.DisplayManager
++import android.os.Bundle
++import android.os.Handler
++import android.os.Looper
++import android.util.DisplayMetrics
++import android.util.Log
++import android.view.Display
++import android.view.MotionEvent
++import android.view.SurfaceHolder
++import android.view.SurfaceView
++import android.view.View
++import android.view.ViewGroup
++import android.view.WindowManager
++
++/**
++ * Shows a [Presentation] on a secondary physical display (e.g. the AYN Thor's bottom screen)
++ * containing one SurfaceView. The game (mod) draws into that surface from native code and
++ * receives touches through [SecondaryDisplayBridge].
++ *
++ * Nothing is shown until the game asks for it, so other games keep a normal second screen.
++ */
++class SecondaryDisplayPresenter(private val activity: Activity) {
++
++    private val handler = Handler(Looper.getMainLooper())
++    private var displayManager: DisplayManager? = null
++    private var presentation: SecondaryPresentation? = null
++    private var wanted = false
++
++    private val listener = object : DisplayManager.DisplayListener {
++        override fun onDisplayAdded(displayId: Int) {
++            if (wanted) show()
++        }
++
++        override fun onDisplayRemoved(displayId: Int) {
++            if (presentation?.display?.displayId == displayId) dismiss()
++        }
++
++        override fun onDisplayChanged(displayId: Int) {}
++    }
++
++    /** Call on the main thread. */
++    fun setEnabled(enable: Boolean) {
++        if (enable) {
++            if (!wanted) {
++                wanted = true
++                val dm = displayManager
++                    ?: (activity.getSystemService(Context.DISPLAY_SERVICE) as DisplayManager)
++                displayManager = dm
++                dm.registerDisplayListener(listener, handler)
++            }
++            show()
++        } else if (wanted) {
++            wanted = false
++            displayManager?.unregisterDisplayListener(listener)
++            dismiss()
++        }
++    }
++
++    fun onResume() {
++        if (wanted && presentation == null) show()
++    }
++
++    fun release() = setEnabled(false)
++
++    private fun show() {
++        if (presentation != null) return
++        val dm = displayManager ?: return
++        val current = activity.window.decorView.display?.displayId ?: Display.DEFAULT_DISPLAY
++
++        val target = dm.getDisplays(DisplayManager.DISPLAY_CATEGORY_PRESENTATION)
++            .firstOrNull { it.displayId != current }
++            ?: dm.displays.firstOrNull { it.displayId != current && it.state != Display.STATE_OFF }
++
++        if (target == null) {
++            Log.i(TAG, "No secondary display found (current=$current)")
++            return
++        }
++        try {
++            val p = SecondaryPresentation(activity, target)
++            p.show()
++            presentation = p
++            Log.i(TAG, "Presentation shown on display ${target.displayId} (${target.name})")
++        } catch (e: Exception) {
++            Log.e(TAG, "Could not show Presentation on display ${target.displayId}", e)
++            presentation = null
++        }
++    }
++
++    private fun dismiss() {
++        try {
++            presentation?.dismiss()
++        } catch (e: Exception) {
++            Log.w(TAG, "dismiss failed", e)
++        }
++        presentation = null
++        try {
++            SecondaryDisplayBridge.nativeSurfaceDestroyed()
++        } catch (_: UnsatisfiedLinkError) {
++        }
++    }
++
++    private class SecondaryPresentation(ctx: Context, display: Display) : Presentation(ctx, display) {
++
++        override fun onCreate(savedInstanceState: Bundle?) {
++            super.onCreate(savedInstanceState)
++
++            window?.apply {
++                // NOT_FOCUSABLE: touching this screen must not steal window focus from the game
++                // (that would make SDL think the game lost focus and pause it).
++                addFlags(WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
++                        WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
++                setBackgroundDrawable(ColorDrawable(Color.BLACK))
++            }
++
++            val surfaceView = SurfaceView(context)
++            setContentView(surfaceView)
++            window?.setLayout(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
++
++            surfaceView.holder.addCallback(object : SurfaceHolder.Callback {
++                override fun surfaceCreated(holder: SurfaceHolder) {
++                    // Render at a fraction of native resolution: cheaper to read back and copy,
++                    // and the compositor scales it up (crisp pixel-art look).
++                    val m = DisplayMetrics()
++                    @Suppress("DEPRECATION")
++                    display.getRealMetrics(m)
++                    holder.setFixedSize(
++                        maxOf(MIN_W, m.widthPixels / DIVISOR),
++                        maxOf(MIN_H, m.heightPixels / DIVISOR)
++                    )
++                }
++
++                override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
++                    try {
++                        SecondaryDisplayBridge.nativeSurfaceChanged(holder.surface, width, height)
++                    } catch (e: UnsatisfiedLinkError) {
++                        Log.e(TAG, "native bridge missing", e)
++                    }
++                }
++
++                override fun surfaceDestroyed(holder: SurfaceHolder) {
++                    try {
++                        SecondaryDisplayBridge.nativeSurfaceDestroyed()
++                    } catch (_: UnsatisfiedLinkError) {
++                    }
++                }
++            })
++
++            surfaceView.setOnTouchListener { v, e -> forwardTouch(v, e); true }
++        }
++
++        @SuppressLint("ClickableViewAccessibility")
++        private fun forwardTouch(v: View, e: MotionEvent) {
++            val w = maxOf(1, v.width).toFloat()
++            val h = maxOf(1, v.height).toFloat()
++            try {
++                when (e.actionMasked) {
++                    MotionEvent.ACTION_DOWN, MotionEvent.ACTION_POINTER_DOWN -> {
++                        val i = e.actionIndex
++                        SecondaryDisplayBridge.nativeTouch(0, e.getPointerId(i), e.getX(i) / w, e.getY(i) / h)
++                    }
++                    MotionEvent.ACTION_MOVE -> {
++                        for (i in 0 until e.pointerCount)
++                            SecondaryDisplayBridge.nativeTouch(1, e.getPointerId(i), e.getX(i) / w, e.getY(i) / h)
++                    }
++                    MotionEvent.ACTION_UP, MotionEvent.ACTION_POINTER_UP -> {
++                        val i = e.actionIndex
++                        SecondaryDisplayBridge.nativeTouch(2, e.getPointerId(i), e.getX(i) / w, e.getY(i) / h)
++                    }
++                    MotionEvent.ACTION_CANCEL -> {
++                        for (i in 0 until e.pointerCount)
++                            SecondaryDisplayBridge.nativeTouch(2, e.getPointerId(i), e.getX(i) / w, e.getY(i) / h)
++                    }
++                }
++            } catch (_: UnsatisfiedLinkError) {
++            }
++        }
++    }
++
++    companion object {
++        private const val TAG = "RALSecondary"
++        private const val DIVISOR = 2
++        private const val MIN_W = 320
++        private const val MIN_H = 240
++    }
++}
+diff --git a/app/src/main/java/com/app/ralaunch/feature/game/ui/legacy/GameActivity.kt b/app/src/main/java/com/app/ralaunch/feature/game/ui/legacy/GameActivity.kt
+index e896e5c..49e9054 100644
+--- a/app/src/main/java/com/app/ralaunch/feature/game/ui/legacy/GameActivity.kt
++++ b/app/src/main/java/com/app/ralaunch/feature/game/ui/legacy/GameActivity.kt
+@@ -1,5 +1,7 @@
+ package com.app.ralaunch.feature.game.ui.legacy
+ 
++import com.app.ralaunch.feature.game.secondary.SecondaryDisplayBridge
++import com.app.ralaunch.feature.game.secondary.SecondaryDisplayPresenter
+ import android.annotation.SuppressLint
+ import android.app.Activity
+ import android.content.Context
+@@ -36,6 +38,9 @@ import org.libsdl.app.SDLActivity
+  */
+ class GameActivity : SDLActivity(), GameContract.View {
+ 
++    // Second-screen window (e.g. AYN Thor bottom display); only shown when a mod asks for it
++    private var secondaryDisplay: SecondaryDisplayPresenter? = null
++
+     companion object {
+         private const val TAG = "GameActivity"
+         private const val CONTROL_EDITOR_REQUEST_CODE = 2001
+@@ -145,6 +150,14 @@ class GameActivity : SDLActivity(), GameContract.View {
+         instance = this
+         presenter.attach(this)
+ 
++        try {
++            secondaryDisplay = SecondaryDisplayPresenter(this)
++            SecondaryDisplayBridge.controller = { enable -> secondaryDisplay?.setEnabled(enable) }
++            SecondaryDisplayBridge.nativeInit()
++        } catch (e: Throwable) {
++            AppLog.w(TAG, "Secondary display bridge unavailable: ${e.message}")
++        }
++
+         initializeErrorHandler()
+         forceLandscapeOrientation()
+         initializeFullscreenManager()
+@@ -212,6 +225,7 @@ class GameActivity : SDLActivity(), GameContract.View {
+     override fun onResume() {
+         super.onResume()
+         requestHighRefreshRate("onResume")
++        secondaryDisplay?.onResume()
+     }
+ 
+     @Deprecated("Deprecated in Java")
+@@ -231,6 +245,9 @@ class GameActivity : SDLActivity(), GameContract.View {
+ 
+     override fun onDestroy() {
+         AppLog.d(TAG, "GameActivity.onDestroy() called")
++        SecondaryDisplayBridge.controller = null
++        secondaryDisplay?.release()
++        secondaryDisplay = null
+ 
+         virtualControlsManager.stop()
+         presenter.detach()
