@@ -1,0 +1,65 @@
+name: Build v2.1.1 + Second Screen
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout your fork (for the patch file)
+        uses: actions/checkout@v4
+        with:
+          path: fork
+
+      - name: Checkout upstream v2.1.1
+        uses: actions/checkout@v4
+        with:
+          repository: FireworkSky/RotatingartLauncher
+          ref: v2.1.1
+          submodules: recursive
+          lfs: true
+          path: src
+
+      - name: Apply second-screen patch
+        working-directory: src
+        run: git apply ../fork/ral-dual-screen-v2.1.1.patch
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Install Android SDK packages
+        run: |
+          SDKM="$(command -v sdkmanager || ls -d "$ANDROID_HOME"/cmdline-tools/*/bin/sdkmanager | head -1)"
+          yes | "$SDKM" --licenses > /dev/null || true
+          "$SDKM" --install "ndk;28.0.13004108" "cmake;3.22.1" "platforms;android-36" "build-tools;36.0.0"
+
+      - name: Build release APK
+        working-directory: src
+        run: |
+          chmod +x ./gradlew
+          ./gradlew assembleRelease --no-daemon --stacktrace
+
+      - name: Sign with a throwaway key
+        working-directory: src
+        run: |
+          keytool -genkey -v -keystore debug.keystore -alias androiddebugkey \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass android -keypass android \
+            -dname "CN=Android Debug, O=Android, C=US"
+          UNSIGNED=$(find app/build/outputs/apk/release -name "*-unsigned.apk" | head -1)
+          "$ANDROID_HOME/build-tools/36.0.0/apksigner" sign \
+            --ks debug.keystore --ks-key-alias androiddebugkey \
+            --ks-pass pass:android --key-pass pass:android \
+            --out ../app-release-signed.apk "$UNSIGNED"
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: rotatingartlauncher-v2.1.1-second-screen-apk
+          path: app-release-signed.apk
+          if-no-files-found: error
