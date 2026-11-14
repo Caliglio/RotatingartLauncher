@@ -7,6 +7,7 @@ on:
       - main
     paths:
       - 'app/**'
+      - 'core/**'
       - 'shared/**'
       - 'gradle/**'
       - 'gradlew'
@@ -31,17 +32,18 @@ jobs:
           distribution: temurin
           java-version: '21'
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Install Android NDK r28 and CMake
-        run: sdkmanager --install 'ndk;28.0.12433566' 'cmake;3.22.1'
+      - name: Install Android SDK packages (runner's preinstalled SDK)
+        run: |
+          SDKM="$(command -v sdkmanager || ls -d "$ANDROID_HOME"/cmdline-tools/*/bin/sdkmanager | head -1)"
+          echo "Using $SDKM"
+          yes | "$SDKM" --licenses > /dev/null || true
+          "$SDKM" --install "ndk;29.0.14206865" "cmake;3.22.1" "platforms;android-36"
 
       - name: Make Gradle wrapper executable
         run: chmod +x ./gradlew
 
       - name: Build debug APK
-        run: ./gradlew assembleDebug
+        run: ./gradlew assembleDebug --no-daemon --stacktrace
 
       - name: Upload debug APK artifact
         uses: actions/upload-artifact@v4
